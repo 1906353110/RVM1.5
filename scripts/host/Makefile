@@ -5,7 +5,7 @@ qemu_image := ubuntu-20.04-server-cloudimg-amd64.img
 qemu_args := \
   -smp 4 -m 4G -accel kvm -nographic \
   -machine q35,kernel_irqchip=split \
-  -cpu host,-kvm-asyncpf,-kvm-pv-eoi,-kvm-pv-ipi,-kvm-pv-sched-yield,-kvm-pv-unhalt,-kvm-steal-time,-kvmclock \
+  -cpu host,+svm,-kvm-asyncpf,-kvm-pv-eoi,-kvm-pv-ipi,-kvm-pv-sched-yield,-kvm-pv-unhalt,-kvm-steal-time,-kvmclock \
   -drive file=$(qemu_image) \
   -net user,id=net,hostfwd=tcp::$(PORT)-:22 -net nic,model=e1000e \
   -serial mon:stdio
@@ -30,3 +30,14 @@ qemu: $(qemu_image)
 
 ssh:
 	ssh -p $(PORT) ubuntu@localhost
+	
+	
+qemu-official:
+	$(QEMU) \
+	-machine q35 -m 1G -enable-kvm -smp 4 \
+	-cpu host,+svm,-kvm-pv-eoi,-kvm-pv-ipi,-kvm-asyncpf,-kvm-steal-time,-kvmclock \
+	-drive file=$(qemu_image),format=qcow2,id=disk,if=none \
+	-device ide-hd,drive=disk \
+	-serial stdio -serial vc \
+	-netdev user,id=net -device e1000e,addr=2.0,netdev=net \
+	-device intel-hda,addr=1b.0 -device hda-duplex -device pcie-pci-bridge

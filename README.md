@@ -54,3 +54,28 @@ make [VENDOR=intel|amd] [LOG=warn|info|debug|trace]
     ```bash
     ./enable-rvm.sh                 # in guest
     ```
+
+
+scp -P 2333 scripts/guest/* ubuntu@localhost:/home/ubuntu
+这个命令，ssh协议复制。
+
+![alt text](images/README/image.png)
+
+ssh -p 2333 ubuntu@localhost
+相当于能多开了，但是如果你关掉qemu的那个，就会断开了
+
+./setup.sh
+make scp VENDOR=amd
+./enable-rvm
+
+第一行的是下载jailhouse
+第二行就是拷贝hypervisor和简单的os（我觉得是这样吧）
+第三行就是利用jailhouse启动hypervisor了
+
+也就是这里大部分代码就是准备为jailhouse适配的hypervisor和简单的os？
+我感觉我最后还是需要看一下，它那个type1.5的x86怎么实现的
+
+
+# 踩的坑
+/// 在rust的最前面和最后面不能写这个
+
