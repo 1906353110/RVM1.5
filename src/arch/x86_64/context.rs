@@ -8,11 +8,13 @@ use super::tables::{GdtStruct, IdtStruct};
 
 const SAVED_LINUX_REGS: usize = 8;
 
+/// 表示 Linux 的 CPU 上下文，包含返回地址、通用寄存器、段寄存器、控制寄存器等。
 #[derive(Debug)]
 pub struct LinuxContext {
-    pub rsp: u64,
-    pub rip: u64,
+    pub rsp: u64, // 栈顶指针
+    pub rip: u64, // 返回地址
 
+    // Callee-saved 寄存器
     pub r15: u64,
     pub r14: u64,
     pub r13: u64,
@@ -20,6 +22,7 @@ pub struct LinuxContext {
     pub rbx: u64,
     pub rbp: u64,
 
+    // 段寄存器和描述符
     pub es: Segment,
     pub cs: Segment,
     pub ss: Segment,
@@ -30,10 +33,10 @@ pub struct LinuxContext {
     pub gdt: DescriptorTablePointer,
     pub idt: DescriptorTablePointer,
 
+    // 控制寄存器和 MSR
     pub cr0: Cr0Flags,
     pub cr3: u64,
     pub cr4: Cr4Flags,
-
     pub efer: u64,
     pub star: u64,
     pub lstar: u64,
@@ -44,6 +47,7 @@ pub struct LinuxContext {
     pub mtrr_def_type: u64,
 }
 
+/// 一般通用寄存器布局。
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct GeneralRegisters {
@@ -65,6 +69,7 @@ pub struct GeneralRegisters {
     pub r15: u64,
 }
 
+// 保存寄存器到栈，用于上下文切换
 macro_rules! save_regs_to_stack {
     () => {
         "
@@ -87,6 +92,7 @@ macro_rules! save_regs_to_stack {
     };
 }
 
+// 从栈恢复寄存器
 macro_rules! restore_regs_from_stack {
     () => {
         "
@@ -110,7 +116,8 @@ macro_rules! restore_regs_from_stack {
 }
 
 impl LinuxContext {
-    /// Load linux callee-saved registers from the stack, and other system registers.
+    /// 从 Linux 留下的栈中加载上下文，用于后续返回。
+    /// 【需要理解】这个保存的是在调用 hypervisor 前 Linux 的上下文。
     pub fn load_from(linux_sp: usize) -> Self {
         let regs = unsafe { core::slice::from_raw_parts(linux_sp as *const u64, SAVED_LINUX_REGS) };
         let gdt = GdtStruct::sgdt();
@@ -121,19 +128,12 @@ impl LinuxContext {
 
         Self {
             rsp: regs.as_ptr_range().end as _,
-            r15: regs[1],
-            r14: regs[2],
-            r13: regs[3],
-            r12: regs[4],
-            rbx: regs[5],
-            rbp: regs[6],
-            rip: regs[7],
+            r15: regs[1], r14: regs[2], r13: regs[3], r12: regs[4], rbx: regs[5], rbp: regs[6], rip: regs[7],
             es: Segment::from_selector(segmentation::es(), &gdt),
             cs: Segment::from_selector(segmentation::cs(), &gdt),
             ss: Segment::from_selector(segmentation::ss(), &gdt),
             ds: Segment::from_selector(segmentation::ds(), &gdt),
-            fs,
-            gs,
+            fs, gs,
             tss: Segment::from_selector(unsafe { task::tr() }, &gdt),
             gdt,
             idt: IdtStruct::sidt(),
@@ -151,9 +151,11 @@ impl LinuxContext {
         }
     }
 
-    /// Restore system registers.
+    /// 恢复之前保存的系统级状态。
+    /// 【重要】这个操作会修改控制寄存器和 GDT/IDT，真正让 CPU 回到 Linux 的上下文。
     pub fn restore(&self) {
         unsafe {
+            // 写回 MSR 寄存器
             Msr::IA32_EFER.write(self.efer);
             Msr::IA32_STAR.write(self.star);
             Msr::IA32_LSTAR.write(self.lstar);
@@ -162,21 +164,17 @@ impl LinuxContext {
             Msr::IA32_KERNEL_GSBASE.write(self.kernel_gsbase);
             Msr::IA32_PAT.write(self.pat);
 
+            // 控制寄存器
             Cr0::write(self.cr0);
             Cr4::write(self.cr4);
-            // cr3 must be last in case cr4 enables PCID
-            Cr3::write(
-                PhysFrame::containing_address(PhysAddr::new(self.cr3)),
-                Cr3Flags::empty(), // clear PCID
-            );
+            Cr3::write(PhysFrame::containing_address(PhysAddr::new(self.cr3)), Cr3Flags::empty());
 
-            // Copy Linux TSS descriptor into our GDT, clearing the busy flag,
-            // then reload TR from it. We can't use Linux' GDT as it is r/o.
+            // 设置 GDT/TSS
             let mut hv_gdt = GdtStruct::from_pointer(&GdtStruct::sgdt());
-            let liunx_gdt = GdtStruct::from_pointer(&self.gdt);
+            let linux_gdt = GdtStruct::from_pointer(&self.gdt);
             let tss_idx = self.tss.selector.index() as usize;
-            hv_gdt[tss_idx] = liunx_gdt[tss_idx];
-            hv_gdt[tss_idx + 1] = liunx_gdt[tss_idx + 1];
+            hv_gdt[tss_idx] = linux_gdt[tss_idx];
+            hv_gdt[tss_idx + 1] = linux_gdt[tss_idx + 1];
             hv_gdt.load_tss(self.tss.selector);
 
             GdtStruct::lgdt(&self.gdt);
@@ -193,19 +191,20 @@ impl LinuxContext {
         }
     }
 
-    /// Restore linux general-purpose registers and stack, then return back to linux.
+    /// 使用保存的 RIP 和 RSP 返回 Linux。
+    /// 【需掌握】vCPU 执行完成后，如何跳回 Linux：靠 ret 指令配合堆栈。
     pub fn return_to_linux(&self, guest_regs: &GeneralRegisters) -> ! {
         unsafe {
             Msr::IA32_GS_BASE.write(self.gs.base);
             core::arch::asm!(
                 "mov rsp, {linux_rsp}",
                 "push {linux_rip}",
-                "mov rcx, rsp",
+                "mov rcx, rsp", // 保存 rip 位置，后面要放进 guest 栈里
                 "mov rsp, {guest_regs}",
-                "mov [rsp + {guest_regs_size}], rcx",
+                "mov [rsp + {guest_regs_size}], rcx", // 写 rip 到 guest 栈尾
                 restore_regs_from_stack!(),
-                "pop rsp",
-                "ret",
+                "pop rsp", // 还原原始栈顶
+                "ret", // 返回 Linux
                 linux_rsp = in(reg) self.rsp,
                 linux_rip = in(reg) self.rip,
                 guest_regs = in(reg) guest_regs,
